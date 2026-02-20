@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hadith Reader</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          boxShadow: {
+            soft: '0 8px 30px rgba(0,0,0,0.08)'
+          }
+        }
+      }
+    };
+  </script>
+</head>
+<body class="h-full bg-slate-50 text-slate-800 dark:bg-slate-950 dark:text-slate-100">
+  <div id="app" class="mx-auto min-h-full max-w-5xl pb-24">
+    <header class="sticky top-0 z-40 border-b border-slate-200/70 bg-white/90 px-4 py-3 backdrop-blur dark:border-slate-800 dark:bg-slate-900/90">
+      <div class="flex items-center justify-between gap-2">
+        <div>
+          <h1 class="text-lg font-semibold tracking-tight">Hadith Reader</h1>
+          <p id="statusText" class="text-xs text-slate-500 dark:text-slate-400">Ready</p>
+        </div>
+        <button id="themeToggle" class="rounded-full border border-slate-300 p-2 text-sm dark:border-slate-700" aria-label="Toggle dark mode">🌙</button>
+      </div>
+      <div class="mt-3">
+        <input id="globalSearch" type="search" placeholder="Search books or hadith text..." class="w-full rounded-xl border border-slate-200 bg-slate-50 px-4 py-2 text-sm outline-none ring-indigo-500 transition focus:ring dark:border-slate-700 dark:bg-slate-800" />
+      </div>
+    </header>
+
+    <main id="view" class="px-4 py-4"></main>
+  </div>
+
+  <nav class="fixed bottom-0 left-0 right-0 z-50 border-t border-slate-200 bg-white/95 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95">
+    <div class="mx-auto grid max-w-5xl grid-cols-4">
+      <button data-nav="home" class="nav-btn px-3 py-3 text-xs font-medium">Home</button>
+      <button data-nav="books" class="nav-btn px-3 py-3 text-xs font-medium">Books</button>
+      <button data-nav="bookmarks" class="nav-btn px-3 py-3 text-xs font-medium">Bookmarks</button>
+      <button data-nav="settings" class="nav-btn px-3 py-3 text-xs font-medium">Settings</button>
+    </div>
+  </nav>
+
+  <script>
+    // -----------------------------
+    // Storage + cache keys
+    // -----------------------------
+    const STORAGE_KEYS = {
+      cache: 'hadith_reader_cache_v1',
+      bookmarks: 'hadith_reader_bookmarks_v1',
+      progress: 'hadith_reader_progress_v1',
+      theme: 'hadith_reader_theme_v1'
+    };
+
+    const API_BASE = 'https://cdn.jsdelivr.net/gh/fawazahmed0/hadith-api@1';
+    const CACHE = JSON.parse(localStorage.getItem(STORAGE_KEYS.cache) || '{}');
+
+    const state = {
+      route: 'home',
+      books: [],
+      bookFilter: '',
+      hadithFilter: '',
+      activeBook: null,
+      activeChapter: null,
+      editionsByBook: {},
+      chapterList: [],
+      chapterHadith: [],
+      searchResults: []
+    };
+
+    const view = document.getElementById('view');
+    const statusText = document.getElementById('statusText');
+    const searchInput = document.getElementById('globalSearch');
+
+    const getBookmarks = () => JSON.parse(localStorage.getItem(STORAGE_KEYS.bookmarks) || '[]');
+    const getProgress = () => JSON.parse(localStorage.getItem(STORAGE_KEYS.progress) || '{}');
+
+    const saveCache = () => localStorage.setItem(STORAGE_KEYS.cache, JSON.stringify(CACHE));
+    const saveBookmarks = (data) => localStorage.setItem(STORAGE_KEYS.bookmarks, JSON.stringify(data));
+    const saveProgress = (data) => localStorage.setItem(STORAGE_KEYS.progress, JSON.stringify(data));
+
+    function setStatus(msg) { statusText.textContent = msg; }
+
+    // -----------------------------
+    // Fetch + localStorage caching mechanism
+    // Never refetch when cached.
+    // -----------------------------
+    async function fetchWithCache(path, cacheKey) {
+      if (CACHE[cacheKey]) return CACHE[cacheKey];
+      const url = `${API_BASE}${path}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Failed request: ${res.status}`);
+      const data = await res.json();
+      CACHE[cacheKey] = data;
+      saveCache();
+      return data;
+    }
+
+    function normalizeEditions(editionsData) {
+      const raw = Array.isArray(editionsData) ? editionsData : (editionsData?.editions || Object.values(editionsData || {}));
+      const grouped = {};
+      for (const item of raw) {
+        const editionId = item.name || item.edition || item.id || item.identifier || item;
+        if (!editionId || typeof editionId !== 'string') continue;
+        const parts = editionId.split('-');
+        if (parts.length < 2) continue;
+        const language = parts[0];
+        const slug = parts.slice(1).join('-');
+        if (!grouped[slug]) grouped[slug] = [];
+        grouped[slug].push({ editionId, language });
+      }
+      state.editionsByBook = grouped;
+      state.books = Object.keys(grouped)
+        .sort((a, b) => a.localeCompare(b))
+        .map(slug => ({
+          slug,
+          name: slug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase()),
+          languages: grouped[slug].map(e => e.language)
+        }));
+    }
+
+    // -----------------------------
+    // Dark mode persistence
+    // -----------------------------
+    function applyTheme(theme) {
+      const root = document.documentElement;
+      if (theme === 'dark') root.classList.add('dark');
+      else root.classList.remove('dark');
+      document.getElementById('themeToggle').textContent = theme === 'dark' ? '☀️' : '🌙';
+    }
+
+    function initTheme() {
+      const saved = localStorage.getItem(STORAGE_KEYS.theme) || 'light';
+      applyTheme(saved);
+      document.getElementById('themeToggle').addEventListener('click', () => {
+        const current = document.documentElement.classList.contains('dark') ? 'dark' : 'light';
+        const next = current === 'dark' ? 'light' : 'dark';
+        localStorage.setItem(STORAGE_KEYS.theme, next);
+        applyTheme(next);
+      });
+    }
+
+    // -----------------------------
+    // Bookmarks + word-level logic
+    // -----------------------------
+    function addBookmark(payload) {
+      const all = getBookmarks();
+      const id = `${payload.book}|${payload.chapter}|${payload.hadithId}|${payload.wordIndex ?? 'h'}`;
+      if (all.find(b => b.id === id)) return;
+      all.unshift({ id, createdAt: Date.now(), ...payload });
+      saveBookmarks(all);
+      setStatus('Bookmark saved');
+      if (state.route === 'bookmarks') render();
+    }
+
+    function updateProgress(payload) {
+      const next = { ...getProgress(), ...payload, updatedAt: Date.now() };
+      saveProgress(next);
+    }
+
+    function tokenizeForBookmarking(text, meta) {
+      const words = String(text || '').split(/(\s+)/).filter(Boolean);
+      return words.map((word, i) => {
+        if (/^\s+$/.test(word)) return `<span>${word}</span>`;
+        const safe = word.replace(/"/g, '&quot;');
+        return `<button class="word-token rounded px-0.5 hover:bg-amber-100 dark:hover:bg-amber-900/40" data-word-index="${i}" data-word="${safe}" data-book="${meta.book}" data-chapter="${meta.chapter}" data-hadith="${meta.hadithId}" type="button">${word}</button>`;
+      }).join('');
+    }
+
+    function bindWordBookmarkEvents() {
+      const tokens = document.querySelectorAll('.word-token');
+      tokens.forEach(btn => {
+        let pressTimer;
+        const saveWordBookmark = () => {
+          addBookmark({
+            type: 'word',
+            book: btn.dataset.book,
+            chapter: btn.dataset.chapter,
+            hadithId: btn.dataset.hadith,
+            wordIndex: Number(btn.dataset.wordIndex),
+            word: btn.dataset.word
+          });
+          btn.classList.add('bg-amber-200', 'dark:bg-amber-700/50');
+        };
+
+        btn.addEventListener('click', () => {
+          updateProgress({
+            book: btn.dataset.book,
+            chapter: btn.dataset.chapter,
+            hadithId: btn.dataset.hadith,
+            wordIndex: Number(btn.dataset.wordIndex)
+          });
+        });
+
+        btn.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          saveWordBookmark();
+        });
+
+        btn.addEventListener('touchstart', () => {
+          pressTimer = setTimeout(saveWordBookmark, 550);
+        }, { passive: true });
+        ['touchend', 'touchcancel', 'mouseleave', 'mouseup'].forEach(evt => {
+          btn.addEventListener(evt, () => clearTimeout(pressTimer));
+        });
+      });
+    }
+
+    // -----------------------------
+    // Data loading utilities
+    // -----------------------------
+    async function loadBooks() {
+      setStatus('Loading books...');
+      try {
+        const editions = await fetchWithCache('/editions.json', 'editions');
+        normalizeEditions(editions);
+        setStatus(`Loaded ${state.books.length} books`);
+      } catch (err) {
+        setStatus('Offline mode: using cached data if available');
+        if (CACHE.editions) normalizeEditions(CACHE.editions);
+      }
+    }
+
+    async function loadBookChapters(slug) {
+      const editions = state.editionsByBook[slug] || [];
+      if (!editions.length) return [];
+      const primary = editions.find(e => e.language === 'eng') || editions[0];
+      const data = await fetchWithCache(`/editions/${primary.editionId}.json`, `edition_${primary.editionId}`);
+      const hadiths = data?.hadiths || data?.data?.hadiths || [];
+      const chaptersMap = new Map();
+      hadiths.forEach((h, idx) => {
+        const chapterNum = String(h.chapter || h.chapterNumber || h.reference?.chapter || 1);
+        const chapterTitle = h.chapterTitle || h.chapterEnglish || `Chapter ${chapterNum}`;
+        if (!chaptersMap.has(chapterNum)) chaptersMap.set(chapterNum, { number: chapterNum, title: chapterTitle, count: 0 });
+        chaptersMap.get(chapterNum).count += 1;
+      });
+      return [...chaptersMap.values()].sort((a, b) => Number(a.number) - Number(b.number));
+    }
+
+    async function loadChapterHadith(slug, chapterNumber) {
+      const editions = state.editionsByBook[slug] || [];
+      const selected = editions.slice(0, 4); // Keep UI lightweight while still multilingual.
+      const sets = await Promise.all(selected.map(async (ed) => {
+        try {
+          const data = await fetchWithCache(`/editions/${ed.editionId}.json`, `edition_${ed.editionId}`);
+          return { lang: ed.language, hadiths: data?.hadiths || data?.data?.hadiths || [] };
+        } catch {
+          return { lang: ed.language, hadiths: [] };
+        }
+      }));
+
+      const byLang = {};
+      sets.forEach(s => byLang[s.lang] = s.hadiths.filter(h => String(h.chapter || h.chapterNumber || h.reference?.chapter || 1) === String(chapterNumber)));
+      const primaryLang = Object.keys(byLang)[0];
+      const primary = byLang[primaryLang] || [];
+
+      return primary.map((h, idx) => {
+        const id = String(h.hadithnumber || h.hadithNumber || h.id || idx + 1);
+        const row = { id, chapter: chapterNumber, texts: {} };
+        Object.entries(byLang).forEach(([lang, list]) => {
+          const found = list.find(x => String(x.hadithnumber || x.hadithNumber || x.id || '') === id) || list[idx];
+          row.texts[lang] = found?.text || found?.hadith || found?.body || '';
+        });
+        return row;
+      });
+    }
+
+    // -----------------------------
+    // Rendering: mobile responsive UI + views
+    // -----------------------------
+    function renderNavActive() {
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.className = `nav-btn px-3 py-3 text-xs font-medium ${state.route === btn.dataset.nav ? 'text-indigo-600 dark:text-indigo-400' : 'text-slate-500 dark:text-slate-400'}`;
+      });
+    }
+
+    function continueReadingCard() {
+      const progress = getProgress();
+      if (!progress.book) return '';
+      return `
+      <section class="mb-4 rounded-2xl border border-indigo-200 bg-indigo-50 p-4 dark:border-indigo-900 dark:bg-indigo-900/20">
+        <h2 class="text-sm font-semibold">Continue Reading</h2>
+        <p class="mt-1 text-sm">${progress.book} • Chapter ${progress.chapter || '-'} • Hadith ${progress.hadithId || '-'}</p>
+        <button id="continueBtn" class="mt-3 rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white">Resume</button>
+      </section>`;
+    }
+
+    function renderHome() {
+      const filtered = state.books.filter(b => b.name.toLowerCase().includes(state.bookFilter.toLowerCase()));
+      view.innerHTML = `
+        ${continueReadingCard()}
+        <section class="space-y-2">
+          ${filtered.map(book => `
+            <button data-open-book="${book.slug}" class="w-full rounded-xl border border-slate-200 bg-white p-4 text-left shadow-soft dark:border-slate-700 dark:bg-slate-900">
+              <p class="font-semibold">${book.name}</p>
+              <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">Languages: ${book.languages.join(', ')}</p>
+            </button>
+          `).join('') || '<p class="text-sm text-slate-500">No books found.</p>'}
+        </section>
+      `;
+
+      document.getElementById('continueBtn')?.addEventListener('click', async () => {
+        const p = getProgress();
+        if (!p.book) return;
+        await openBook(p.book, p.chapter, p.hadithId, p.wordIndex);
+      });
+
+      document.querySelectorAll('[data-open-book]').forEach(btn => btn.addEventListener('click', () => openBook(btn.dataset.openBook)));
+    }
+
+    function renderBooks() { renderHome(); }
+
+    function renderBookmarks() {
+      const bookmarks = getBookmarks();
+      view.innerHTML = `
+        <section class="space-y-3">
+          <h2 class="text-base font-semibold">Bookmarks</h2>
+          ${bookmarks.map(b => `
+            <button data-jump='${JSON.stringify(b)}' class="w-full rounded-xl border border-slate-200 bg-white p-3 text-left dark:border-slate-700 dark:bg-slate-900">
+              <p class="text-sm font-semibold">${b.book} • Chapter ${b.chapter} • Hadith ${b.hadithId}</p>
+              <p class="mt-1 text-xs text-slate-500 dark:text-slate-400">${b.type === 'word' ? `Word: ${b.word}` : 'Hadith bookmark'}</p>
+            </button>
+          `).join('') || '<p class="text-sm text-slate-500">No bookmarks yet.</p>'}
+        </section>
+      `;
+
+      document.querySelectorAll('[data-jump]').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const b = JSON.parse(btn.dataset.jump);
+          await openBook(b.book, b.chapter, b.hadithId, b.wordIndex);
+        });
+      });
+    }
+
+    function renderSettings() {
+      const cacheSize = Object.keys(CACHE).length;
+      view.innerHTML = `
+        <section class="space-y-3">
+          <h2 class="text-base font-semibold">Settings</h2>
+          <div class="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
+            <p class="text-sm">Cached entries: <strong>${cacheSize}</strong></p>
+            <p class="mt-2 text-xs text-slate-500">Content already opened stays available offline from localStorage cache.</p>
+          </div>
+          <button id="clearBookmarks" class="rounded-lg border border-rose-300 px-3 py-2 text-sm text-rose-600">Clear bookmarks</button>
+        </section>
+      `;
+      document.getElementById('clearBookmarks')?.addEventListener('click', () => {
+        saveBookmarks([]);
+        setStatus('Bookmarks cleared');
+      });
+    }
+
+    function renderChapter() {
+      const q = state.hadithFilter.toLowerCase();
+      const bookmarks = getBookmarks();
+      const filtered = state.chapterHadith.filter(h => Object.values(h.texts).some(t => String(t).toLowerCase().includes(q)) || h.id.includes(q));
+      view.innerHTML = `
+        <button id="backToChapters" class="mb-3 text-sm text-indigo-600 dark:text-indigo-400">← Chapters</button>
+        <h2 class="mb-3 text-base font-semibold">${state.activeBook.name} • Chapter ${state.activeChapter.number}</h2>
+        <div class="space-y-4">
+          ${filtered.map(h => {
+            const langBlocks = Object.entries(h.texts).map(([lang, text]) => `
+              <div class="rounded-lg bg-slate-50 p-3 dark:bg-slate-800/60">
+                <p class="mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500">${lang}</p>
+                <p class="text-[15px] leading-7 ${lang === 'ara' ? 'text-right font-medium' : ''}">${tokenizeForBookmarking(text, { book: state.activeBook.slug, chapter: state.activeChapter.number, hadithId: h.id })}</p>
+              </div>`).join('');
+
+            return `
+              <article id="hadith-${h.id}" class="rounded-2xl border border-slate-200 bg-white p-4 shadow-soft dark:border-slate-700 dark:bg-slate-900">
+                <div class="mb-3 flex items-center justify-between">
+                  <h3 class="font-semibold">Hadith ${h.id}</h3>
+                  <button data-save-hadith="${h.id}" class="rounded-lg border border-slate-300 px-2 py-1 text-xs dark:border-slate-600">Bookmark Hadith</button>
+                </div>
+                ${langBlocks}
+              </article>`;
+          }).join('') || '<p class="text-sm text-slate-500">No hadith found for this query.</p>'}
+        </div>
+      `;
+
+      document.getElementById('backToChapters').addEventListener('click', () => renderBookDetail());
+      document.querySelectorAll('[data-save-hadith]').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const hadithId = btn.dataset.saveHadith;
+          addBookmark({ type: 'hadith', book: state.activeBook.slug, chapter: state.activeChapter.number, hadithId });
+          updateProgress({ book: state.activeBook.slug, chapter: state.activeChapter.number, hadithId });
+        });
+      });
+
+      bindWordBookmarkEvents();
+      highlightBookmarkedWords();
+    }
+
+    function highlightBookmarkedWords() {
+      const wordBookmarks = getBookmarks().filter(b => b.type === 'word');
+      wordBookmarks.forEach(b => {
+        const selector = `.word-token[data-book="${b.book}"][data-chapter="${b.chapter}"][data-hadith="${b.hadithId}"][data-word-index="${b.wordIndex}"]`;
+        document.querySelectorAll(selector).forEach(el => el.classList.add('bg-amber-100', 'dark:bg-amber-900/40'));
+      });
+    }
+
+    async function openBook(bookSlug, chapter = null, hadithId = null, wordIndex = null) {
+      const target = state.books.find(b => b.slug === bookSlug);
+      if (!target) return;
+      state.activeBook = target;
+      setStatus(`Opening ${target.name}...`);
+      try {
+        state.chapterList = await loadBookChapters(target.slug);
+      } catch {
+        state.chapterList = [];
+      }
+      renderBookDetail();
+
+      if (chapter) {
+        await openChapter(chapter, hadithId, wordIndex);
+      }
+    }
+
+    function renderBookDetail() {
+      view.innerHTML = `
+        <button id="backHome" class="mb-3 text-sm text-indigo-600 dark:text-indigo-400">← Back</button>
+        <h2 class="mb-3 text-base font-semibold">${state.activeBook.name} Chapters</h2>
+        <section class="space-y-2">
+          ${state.chapterList.map(ch => `
+            <button data-open-chapter="${ch.number}" class="w-full rounded-xl border border-slate-200 bg-white p-4 text-left dark:border-slate-700 dark:bg-slate-900">
+              <p class="font-semibold">${ch.title}</p>
+              <p class="text-xs text-slate-500">Chapter ${ch.number} • ${ch.count} hadith</p>
+            </button>
+          `).join('') || '<p class="text-sm text-slate-500">No chapter data in cache yet.</p>'}
+        </section>
+      `;
+      document.getElementById('backHome').addEventListener('click', () => {
+        state.route = 'home';
+        render();
+      });
+      document.querySelectorAll('[data-open-chapter]').forEach(btn => btn.addEventListener('click', () => openChapter(btn.dataset.openChapter)));
+    }
+
+    async function openChapter(chapterNumber, jumpHadithId = null, jumpWordIndex = null) {
+      state.activeChapter = state.chapterList.find(c => String(c.number) === String(chapterNumber)) || { number: chapterNumber, title: `Chapter ${chapterNumber}` };
+      setStatus(`Loading chapter ${chapterNumber}...`);
+      state.chapterHadith = await loadChapterHadith(state.activeBook.slug, chapterNumber);
+      renderChapter();
+      setStatus(`Loaded ${state.chapterHadith.length} hadith`);
+
+      updateProgress({ book: state.activeBook.slug, chapter: chapterNumber, hadithId: jumpHadithId || state.chapterHadith[0]?.id });
+
+      // Smooth scroll to bookmarked hadith/word location when reopening.
+      if (jumpHadithId) {
+        const hadithEl = document.getElementById(`hadith-${jumpHadithId}`);
+        hadithEl?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+      if (jumpHadithId && Number.isInteger(jumpWordIndex)) {
+        setTimeout(() => {
+          const wordEl = document.querySelector(`.word-token[data-hadith="${jumpHadithId}"][data-word-index="${jumpWordIndex}"]`);
+          if (wordEl) {
+            wordEl.classList.add('bg-amber-200', 'dark:bg-amber-700/50');
+            wordEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          }
+        }, 350);
+      }
+    }
+
+    function runGlobalSearch(query) {
+      const q = query.trim().toLowerCase();
+      if (!q) {
+        state.bookFilter = '';
+        state.hadithFilter = '';
+        render();
+        return;
+      }
+
+      if (state.activeChapter) {
+        state.hadithFilter = q;
+        renderChapter();
+        return;
+      }
+
+      state.bookFilter = q;
+      if (state.route === 'home' || state.route === 'books') {
+        renderHome();
+      }
+    }
+
+    function render() {
+      renderNavActive();
+      if (state.route === 'home') return renderHome();
+      if (state.route === 'books') return renderBooks();
+      if (state.route === 'bookmarks') return renderBookmarks();
+      if (state.route === 'settings') return renderSettings();
+    }
+
+    async function init() {
+      initTheme();
+      await loadBooks();
+      render();
+
+      // bottom nav handling
+      document.querySelectorAll('.nav-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          state.route = btn.dataset.nav;
+          state.activeBook = null;
+          state.activeChapter = null;
+          render();
+        });
+      });
+
+      searchInput.addEventListener('input', (e) => runGlobalSearch(e.target.value));
+      window.addEventListener('offline', () => setStatus('Offline: reading from cache')); // Offline-ready messaging.
+      window.addEventListener('online', () => setStatus('Back online'));
+    }
+
+    init();
+  </script>
+</body>
+</html>
